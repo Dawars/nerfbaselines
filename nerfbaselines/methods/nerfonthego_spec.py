@@ -37,7 +37,7 @@ python -m pip install -r requirements.txt \
     click==8.1.8 \
     Pillow>=10.2.0 \
     'pytest<=8.3.4' \
-    matplotlib==3.9.4
+    matplotlib==3.8.4
 
 # Manually install rmbrualla's `pycolmap` (don't use pip's! It's different).
 git clone https://github.com/rmbrualla/pycolmap.git ./internal/pycolmap

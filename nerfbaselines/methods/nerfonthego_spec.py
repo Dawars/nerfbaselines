@@ -35,7 +35,7 @@ python -m pip install -r requirements.txt \
     typing_extensions==4.12.2 \
     wandb==0.19.1 \
     click==8.1.8 \
-    Pillow==11.1.0 \
+    Pillow=>10.2.0 \
     'pytest<=8.3.4' \
     matplotlib==3.9.4
 

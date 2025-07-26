@@ -26,7 +26,7 @@ pip install plyfile==0.8.1 \
     'einops==0.8.0' \
     'torch-optimizer==0.3.0' \
     tqdm==4.67.1 \
-    scikit-image==0.25.0 \
+    scikit-image>=0.24.0 \
     importlib_metadata==8.5.0 \
     typing_extensions==4.12.2 \
     tensorboard==2.18.0 \

@@ -19,6 +19,10 @@ metrics = {
     "loss": "loss.item()",
     "l1_loss": "Ll1.item()",
     "psnr": "10 * torch.log10(1 / torch.mean((image - gt_image) ** 2)).item()",
+    "depth_lp_loss": "lp_loss.item() if lp_loss is not None else 0.0",
+    "depth_pearson_loss": "pearson_loss.item() if pearson_loss is not None else 0.0",
+    "diffusion_loss": "diffusion_loss.item() if diffusion_loss is not None else 0.0",
+    "reg_loss": "reg_loss.item() if reg_loss is not None else 0.0",
     "num_points": "len(gaussians.get_xyz)",
 }
 train_step_disabled_names = [
@@ -33,8 +37,7 @@ train_step_disabled_names = [
     "tb_writer",
     "progress_bar",
     "ema_loss_for_log",
-    "ema_dist_for_log",
-    "ema_normal_for_log",
+    "save_cc",
 ]
 
 #
@@ -95,9 +98,12 @@ def _(ast_module: ast.Module):
     ast_module.body.append(getProjectionMatrixFromOpenCV_ast)
 
     # Add missing arguments
-    init.args.args.insert(1, ast.arg(arg="mask", annotation=None, lineno=0, col_offset=0))
-    init.args.args.insert(2, ast.arg(arg="cx", annotation=None, lineno=0, col_offset=0))
-    init.args.args.insert(3, ast.arg(arg="cy", annotation=None, lineno=0, col_offset=0))
+    init.args.kwonlyargs.append(ast.arg(arg="mask", annotation=None, lineno=0, col_offset=0))
+    init.args.kw_defaults.append(ast.Constant(value=None, lineno=0, col_offset=0))
+    init.args.kwonlyargs.append(ast.arg(arg="cx", annotation=None, lineno=0, col_offset=0))
+    init.args.kw_defaults.append(ast.Constant(value=None, lineno=0, col_offset=0))
+    init.args.kwonlyargs.append(ast.arg(arg="cy", annotation=None, lineno=0, col_offset=0))
+    init.args.kw_defaults.append(ast.Constant(value=None, lineno=0, col_offset=0))
 
     # Store mask
     init.body.insert(0, ast.parse("self.mask = mask").body[0])
@@ -110,14 +116,20 @@ def _(ast_module: ast.Module):
     self.image_height, 
     fov2focal(FoVx, self.image_width), 
     fov2focal(FoVy, self.image_height), 
-    cx, 
-    cy, 
+    cx if cx is not None else self.image_width / 2.0, 
+    cy if cy is not None else self.image_height / 2.0,
     self.znear, 
     self.zfar).transpose(0, 1).cuda()
 """).body[0].value  # type: ignore
 
 @import_context.patch_ast_import("scene.dataset_readers")
 def _(ast_module: ast.Module):
+    # First remove 'from recordclass import recordclass, RecordClass'
+    for i, x in enumerate(ast_module.body):
+        if isinstance(x, ast.ImportFrom) and x.module == "recordclass" and any(y.name in ("recordclass", "RecordClass") for y in x.names):
+            ast_module.body.pop(i)
+            break
+
     camera_info_ast = next((x for x in ast_module.body if isinstance(x, ast.ClassDef) and x.name == "CameraInfo"), None)
     assert camera_info_ast is not None, "CameraInfo not found in dataset_readers"
     # Add typing import
@@ -188,82 +200,105 @@ def _(ast_module: ast.Module):
 # </patch blender_create_pcd>
 
 
-# Fix utils.reloc_utils initializing CUDA on import
-# <fix reloc_utils>
-@import_context.patch_ast_import("utils.reloc_utils")
-def _(ast_module: ast.Module):
-    # Original code:
-    """
-    ...
-    binoms = torch.zeros((N_max, N_max)).float().cuda()
-    ...
 
-    def compute_relocation_cuda(opacity_old, scale_old, N):
-        N.clamp_(min=1, max=N_max-1)
-        return compute_relocation(opacity_old, scale_old, N, binoms, N_max)
-    """
-    # Get binoms=...cuda() call
-    binoms_ast = next(x for x in ast_module.body if isinstance(x, ast.Assign) and x.targets[0].id == "binoms")  # type: ignore
-    assert isinstance(binoms_ast.value, ast.Call) and binoms_ast.value.func.attr == "cuda", "binoms.cuda() not found in reloc_utils"  # type: ignore
-    # Remove binoms.cuda()
-    binoms_ast.value = binoms_ast.value.func.value  # type: ignore
-    # Get compute_relocation_cuda
-    compute_relocation_cuda_ast = next(x for x in ast_module.body if isinstance(x, ast.FunctionDef) and x.name == "compute_relocation_cuda")
-    # Add:
-    # global binoms
-    # if binoms.device.type == "cpu":
-    #     binoms = binoms.cuda()
-    compute_relocation_cuda_ast.body.insert(0, ast.Global(names=["binoms"], lineno=0, col_offset=0))
-    compute_relocation_cuda_ast.body.insert(1, ast.parse("""
-if binoms.device.type == "cpu":
-    binoms = binoms.cuda()
-""").body[0])
-# </fix reloc_utils>
+def ast_remove(tree, callback):
+    tree = copy.deepcopy(tree)
+    def _rem(tree):
+        if isinstance(tree, list):
+            return [x for x in (_rem(x) for x in tree) if x is not None]
+        sentinel = ast.AST()
+        class Transformer(ast.NodeTransformer):
+            def visit(self, node):
+                if callback(node):
+                    return sentinel
+                out = self.generic_visit(node)
+                if isinstance(out, ast.Dict):
+                    valid_indices = [
+                        out.keys[i] is not sentinel and out.values[i] is not sentinel 
+                        for i in range(len(out.keys))]
+                    out = ast.Dict(
+                        keys=[x for i, x in enumerate(out.keys) if valid_indices[i]],
+                        values=[x for i, x in enumerate(out.keys) if valid_indices[i]]
+                    )
+                for k, v in ast.iter_fields(out):
+                    if v == sentinel:
+                        return sentinel
+                    if isinstance(v, list):
+                        values = [x for x in v if x is not sentinel]
+                        if v and not values:
+                            return sentinel
+                        setattr(out, k, values)
+                return out
+        out = Transformer().visit(tree)
+        if out is sentinel:
+            return None
+        return out
+    return _rem(tree)
+
 
 def ast_remove_names(tree, names):
-    if isinstance(tree, list):
-        return [x for x in (ast_remove_names(x, names) for x in tree) if x is not None]
-    sentinel = ast.AST()
-    class Transformer(ast.NodeTransformer):
-        def visit(self, node):
-            if isinstance(node, ast.Name) and node.id in names:
-                return sentinel
-            out = self.generic_visit(node)
-            for k, v in ast.iter_fields(out):
-                if v == sentinel:
-                    return sentinel
-                if isinstance(v, list):
-                    values = [x for x in v if x is not sentinel]
-                    if v and not values:
-                        return sentinel
-                    setattr(out, k, values)
-            return out
-    out = Transformer().visit(tree)
-    if out is sentinel:
-        return None
-    return out
+    def _callback(node):
+        return isinstance(node, ast.Name) and node.id in names
+    return ast_remove(tree, _callback)
 
 
 # Patch train to extract the training loop and init
 # <patch train>
 @import_context.patch_ast_import("train")
 def _(ast_module: ast.Module):
+    # Remove instructions from prune_floaters
+    def _prune_callback(node):
+        # Remove plt.figure
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "figure":
+            return True
+        # Remove plt.imsave
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "imsave":
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == "plt":
+                return True
+        # Remove os.makedirs
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (node.func.attr == "makedirs" and
+                isinstance(node.func.value, ast.Name) and node.func.value.id == "os"):
+                return True
+        return False
+    # Replace prune_floaters in ast_module
+    for i, x in enumerate(ast_module.body):
+        if isinstance(x, ast.FunctionDef) and x.name == "prune_floaters":
+            prune_floaters_ast = ast_remove(x, _prune_callback)
+            ast_module.body[i] = prune_floaters_ast
+            break
+    else:
+        assert False, "prune_floaters not found in train"
+
     training_ast = copy.deepcopy(next(x for x in ast_module.body if isinstance(x, ast.FunctionDef) and x.name == "training"))
     # Patch torch.load => torch.load(..., weights_only=False)
     for node in ast.walk(training_ast):
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "load":
-            node.keywords.append(ast.keyword(arg="weights_only", value=ast.Constant(value=False, kind=None, lineno=0, col_offset=0), lineno=0, col_offset=0))
+            node.keywords.append(ast.keyword(arg="weights_only", value=ast.Constant(value=False, kind=None)))
+
     # We remove the unused code
-    ast_remove_names(training_ast, train_step_disabled_names)
+    training_ast = ast_remove_names(training_ast, train_step_disabled_names)
+    # Remove os.makedirs and scene.save
+    def _remove_callback(node):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if (node.func.attr in ("makedirs", "save") and
+                isinstance(node.func.value, ast.Name) and node.func.value.id == "os"):
+                return True
+            if (node.func.attr == "save" and
+                isinstance(node.func.value, ast.Name) and node.func.value.id == "scene"):
+                return True
+        return False
+    training_ast = ast_remove(training_ast, _remove_callback)
+
     # Now, we extract the train iteration code
     train_loop = training_ast.body[-1]
     assert isinstance(train_loop, ast.For) and train_loop.target.id == "iteration", "Expected for loop in training"  # type: ignore
     train_step = list(train_loop.body)
     # Add return statement to train_step
     train_step.append(ast.Return(value=ast.Dict(
-        keys=[ast.Constant(value=name, kind=None, lineno=0, col_offset=0) for name in metrics.keys()], 
+        keys=[ast.Constant(value=name, kind=None) for name in metrics.keys()], 
         values=[ast.parse(value).body[0].value for value in metrics.values()],  # type: ignore
-        lineno=0, col_offset=0), lineno=0, col_offset=0))
+    )))
     # Extract render_pkg = ... index
     render_pkg_idx = next(i for i, x in enumerate(train_step) if isinstance(x, ast.Assign) and x.targets[0].id == "render_pkg")  # type: ignore
     train_step.insert(render_pkg_idx+1, ast.parse("""
@@ -306,16 +341,25 @@ if viewpoint_cam.mask is not None:
     #
     # Use this code to debug when integrating new codebase
     #
-    # print("Train iteration: ")
-    # print(ast.unparse(train_iteration))
-    # setup_train = ast_remove_names(training_ast.body[:-1], ["first_iter"])
-    # for instruction in setup_train:
-    #     Transformer().visit(instruction)
-    # print("Setup train:") 
-    # print(ast.unparse(setup_train))
-    # print()
-    # print("Train step:")
-    # print(ast.unparse(train_step))
-    # print("Train step sets: ")
-    # print(train_step_transformer._stored_names)
-    # breakpoint()
+    ## print("Train iteration: ")
+    ## print(ast.unparse(train_iteration))
+    ## setup_train = ast_remove_names(training_ast.body[:-1], ["first_iter"])
+    ## for instruction in setup_train:
+    ##     Transformer().visit(instruction)
+    ## print("Setup train:") 
+    ## print(ast.unparse(setup_train))
+    ## print()
+    ## # print("Train step:")
+    ## # print(ast.unparse(train_step))
+    ## print("Train step sets: ")
+    ## print(train_step_transformer._stored_names)
+
+
+import_context.apply_patch(r"""
+diff --git a/utils/loss_utils.py b/utils/loss_utils.py
+index fc4dc06..17ec63e 100755
+--- a/utils/loss_utils.py
++++ b/utils/loss_utils.py
+@@ -25,1 +24,0 @@ import torch.nn as nn
+-pearson = PearsonCorrCoef().cuda()
+""".strip())

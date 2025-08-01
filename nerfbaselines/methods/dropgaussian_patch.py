@@ -18,6 +18,7 @@ import_context = Context()
 metrics = {
     "loss": "loss.item()",
     "l1_loss": "Ll1.item()",
+    "ssim": "ssim_value.item()",
     "psnr": "10 * torch.log10(1 / torch.mean((image - gt_image) ** 2)).item()",
     "num_points": "len(gaussians.get_xyz)",
 }
@@ -59,14 +60,12 @@ def getProjectionMatrixFromOpenCV(w, h, fx, fy, cx, cy, znear, zfar):
 @import_context.patch_ast_import("utils.camera_utils")
 def _(ast_module: ast.Module):
     # Make sure PILtoTorch is imported
-    assert any(isinstance(x, ast.ImportFrom) and x.module == "utils.general_utils" and x.names[0].name == "PILtoTorch" for x in ast_module.body), "PILtoTorch not imported in camera_utils"
     load_cam_ast = next((x for x in ast_module.body if isinstance(x, ast.FunctionDef) and x.name == "loadCam"), None)
     assert load_cam_ast is not None, "loadCam not found in camera_utils"
     return_ast = load_cam_ast.body[-1]
     assert isinstance(return_ast, ast.Return), "loadCam does not return camera"
     camera = return_ast.value
     assert isinstance(camera, ast.Call), "loadCam does not return camera"
-    camera.keywords.append(ast.keyword(arg="mask", value=ast.parse("PILtoTorch(cam_info.mask, (gt_image.size[1], gt_image.size[0])) if cam_info.mask is not None else None").body[0].value, lineno=0, col_offset=0))  # type: ignore
     camera.keywords.append(ast.keyword(arg="cx", value=ast.parse("cam_info.cx").body[0].value, lineno=0, col_offset=0))  # type: ignore
     camera.keywords.append(ast.keyword(arg="cy", value=ast.parse("cam_info.cy").body[0].value, lineno=0, col_offset=0))  # type: ignore
 
@@ -76,7 +75,7 @@ def _(ast_module: ast.Module):
 def _(ast_module: ast.Module):
     camera_ast = next((x for x in ast_module.body if isinstance(x, ast.ClassDef) and x.name == "Camera"), None)
     assert camera_ast is not None, "Camera not found in cameras"
-    # Add mask and cx, cy to Camera.__init__
+    # Add cx, cy to Camera.__init__
     init = next((x for x in camera_ast.body if isinstance(x, ast.FunctionDef) and x.name == "__init__"), None)
     assert init is not None, "Camera.__init__ not found"
 
@@ -95,12 +94,11 @@ def _(ast_module: ast.Module):
     ast_module.body.append(getProjectionMatrixFromOpenCV_ast)
 
     # Add missing arguments
-    init.args.args.insert(1, ast.arg(arg="mask", annotation=None, lineno=0, col_offset=0))
     init.args.args.insert(2, ast.arg(arg="cx", annotation=None, lineno=0, col_offset=0))
     init.args.args.insert(3, ast.arg(arg="cy", annotation=None, lineno=0, col_offset=0))
 
     # Store mask
-    init.body.insert(0, ast.parse("self.mask = mask").body[0])
+    init.body.insert(0, ast.parse("self.mask = gt_alpha_mask").body[0])
 
     # Finally, we fix the computed projection matrix
     projection_matrix_ast = next((x for x in init.body if isinstance(x, ast.Assign) and ast.unparse(x.targets[0]) == "self.projection_matrix"), None)
@@ -123,11 +121,8 @@ def _(ast_module: ast.Module):
     # Add typing import
     ast_module.body.insert(0, ast.ImportFrom(module="typing", names=[ast.alias(name="Optional", asname=None, lineno=0, col_offset=0)], level=0, lineno=0, col_offset=0))
 
-    # Add mask and cx, cy attributes to CameraInfo
+    # Add cx, cy attributes to CameraInfo
     camera_info_ast.body.extend([
-        ast.AnnAssign(target=ast.Name(id="mask", ctx=ast.Store(), lineno=0, col_offset=0), 
-                      annotation=ast.parse("Optional[np.ndarray]").body[0].value,  # type: ignore
-                      value=None, simple=1, lineno=0, col_offset=0),
         ast.AnnAssign(target=ast.Name(id="cx", ctx=ast.Store(), lineno=0, col_offset=0), 
                       annotation=ast.Name(id="float", ctx=ast.Load(), lineno=0, col_offset=0),
                       value=None, simple=1, lineno=0, col_offset=0),
@@ -150,7 +145,7 @@ def _(ast_module: ast.Module):
     scene_init.args.args.insert(1, ast.arg(arg="scene_info", annotation=None, lineno=0, col_offset=0))
 
     # Remove dataset detection if statement
-    detection_if = next(x for x in scene_init.body if isinstance(x, ast.If) and ast.unparse(x.test) == "os.path.exists(os.path.join(args.source_path, 'sparse'))")
+    detection_if = next(x for x in scene_init.body if isinstance(x, ast.If) and ast.unparse(x.test) == "args.source_path.find('replica_few') != -1")
     assert detection_if is not None, "Dataset detection if statement not found"
     scene_init.body.remove(detection_if)
 
@@ -170,8 +165,8 @@ def _(ast_module: ast.Module):
     readNerfSyntheticInfo_ast = next((x for x in ast_module.body if isinstance(x, ast.FunctionDef) and x.name == "readNerfSyntheticInfo"), None)
     assert readNerfSyntheticInfo_ast is not None, "readNerfSyntheticInfo not found in dataset_readers"
     # Find condition not os.path.exists(ply_path)
-    if_not_exists = next(x for x in readNerfSyntheticInfo_ast.body if isinstance(x, ast.If) and ast.unparse(x.test) == "not os.path.exists(ply_path)")
-    assert if_not_exists is not None, "if not os.path.exists(ply_path) not found"
+    if_not_exists = next(x for x in readNerfSyntheticInfo_ast.body if isinstance(x, ast.If) and ast.unparse(x.test) == "rand_pcd or not os.path.exists(ply_path)")
+    assert if_not_exists is not None, "rand_pcd or not os.path.exists(ply_path)"
     body = copy.deepcopy(if_not_exists.body)
 
     # Remove storePly call
@@ -269,7 +264,7 @@ def _(ast_module: ast.Module):
     train_step.insert(render_pkg_idx+1, ast.parse("""
 if viewpoint_cam.mask is not None:
     mask = viewpoint_cam.mask.cuda()
-    for k in ["render", "rend_normal", "surf_normal", "rend_dist"]:
+    for k in ["render"]:
         render_pkg[k] = render_pkg[k] * mask + (1.0 - mask) * render_pkg[k].detach()
 """).body[0])
 
@@ -306,16 +301,18 @@ if viewpoint_cam.mask is not None:
     #
     # Use this code to debug when integrating new codebase
     #
-    # print("Train iteration: ")
+    # print("=========== Train iteration ============")
     # print(ast.unparse(train_iteration))
     # setup_train = ast_remove_names(training_ast.body[:-1], ["first_iter"])
     # for instruction in setup_train:
     #     Transformer().visit(instruction)
-    # print("Setup train:") 
+    # print()
+    # print("============ Setup train ============")
     # print(ast.unparse(setup_train))
     # print()
-    # print("Train step:")
+    # print("============ Train step ============")
     # print(ast.unparse(train_step))
-    # print("Train step sets: ")
+    # print()
+    # print("============ Train step sets ============")
     # print(train_step_transformer._stored_names)
-    # breakpoint()
+    # print()

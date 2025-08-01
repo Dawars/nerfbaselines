@@ -921,6 +921,7 @@ def mock_torch(patch_modules):
         "torch.nn.functional": torch.nn.functional,
         "torchvision": torchvision,
         "torchvision.transforms": torchvision.transforms,
+        "torchvision.utils": torchvision.utils,
     }):
         from nerfbaselines.metrics import clear_cache as metrics_clear_cache
         metrics_clear_cache()
@@ -962,7 +963,7 @@ def torch_cpu():
                 args = ("cpu",) + args[1:]
             return oldto(self, *args, **kwargs)  # type: ignore
         patchtensor("to", to)
-        for name in ['zeros', 'ones', 'rand', 'tensor', 'zeros_like', 'ones_like', 'rand_like', 'eye']:
+        for name in ['zeros', 'ones', 'rand', 'tensor', 'zeros_like', 'ones_like', 'rand_like', 'eye', 'randint']:
             patch(name, patchdevice(getattr(torch, name)))
         yield None
     finally:
